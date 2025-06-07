@@ -1,15 +1,16 @@
 import express from "express"
 import type { AuthRequest } from "../middleware/auth"
-import { sql } from "../config/database"
+import Project from "../models/Project"
+import mongoose from "mongoose"
 
 const router = express.Router()
 
 // Get user projects
 router.get("/", async (req: AuthRequest, res) => {
   try {
-    const projects = await sql`
-      SELECT * FROM projects WHERE owner_id = ${req.user!.userId} ORDER BY created_at DESC
-    `
+    const projects = await Project.find({
+      ownerId: new mongoose.Types.ObjectId(req.user!.userId),
+    }).sort({ createdAt: -1 })
 
     res.json({ data: projects })
   } catch (error) {
@@ -22,9 +23,10 @@ router.get("/", async (req: AuthRequest, res) => {
 router.get("/:id", async (req: AuthRequest, res) => {
   try {
     const { id } = req.params
-    const [project] = await sql`
-      SELECT * FROM projects WHERE id = ${id} AND owner_id = ${req.user!.userId}
-    `
+    const project = await Project.findOne({
+      _id: id,
+      ownerId: new mongoose.Types.ObjectId(req.user!.userId),
+    })
 
     if (!project) {
       return res.status(404).json({ error: "Project not found" })
@@ -43,21 +45,29 @@ router.get("/:id/uploads", async (req: AuthRequest, res) => {
     const { id } = req.params
 
     // Verify project ownership
-    const [project] = await sql`
-      SELECT id FROM projects WHERE id = ${id} AND owner_id = ${req.user!.userId}
-    `
+    const project = await Project.findOne({
+      _id: id,
+      ownerId: new mongoose.Types.ObjectId(req.user!.userId),
+    })
 
     if (!project) {
       return res.status(404).json({ error: "Project not found" })
     }
 
-    const uploads = await sql`
-      SELECT uh.*, d.status as deployment_status
-      FROM upload_history uh
-      LEFT JOIN deployments d ON uh.deployment_id = d.id
-      WHERE d.project_id = ${id}
-      ORDER BY uh.created_at DESC
-    `
+    // Find uploads related to this project's deployments
+    const uploads = await mongoose.model("UploadHistory").aggregate([
+      {
+        $lookup: {
+          from: "deployments",
+          localField: "deploymentId",
+          foreignField: "id",
+          as: "deployment",
+        },
+      },
+      { $unwind: "$deployment" },
+      { $match: { "deployment.projectId": id } },
+      { $sort: { createdAt: -1 } },
+    ])
 
     res.json({ data: uploads })
   } catch (error) {

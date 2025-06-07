@@ -1,6 +1,7 @@
 import express from "express"
 import type { AuthRequest } from "../middleware/auth"
-import { sql } from "../config/database"
+import UploadHistory from "../models/UploadHistory"
+import mongoose from "mongoose"
 
 const router = express.Router()
 
@@ -8,43 +9,32 @@ const router = express.Router()
 router.get("/", async (req: AuthRequest, res) => {
   try {
     const { page = 1, limit = 20, deploymentId } = req.query
+    const pageNum = Number(page)
+    const limitNum = Number(limit)
+    const skip = (pageNum - 1) * limitNum
 
-    let query = sql`
-      SELECT uh.*, p.name as project_name, d.status as deployment_status
-      FROM upload_history uh
-      LEFT JOIN deployments d ON uh.deployment_id = d.id
-      LEFT JOIN projects p ON d.project_id = p.id
-      WHERE uh.user_id = ${req.user!.userId}
-    `
-
-    if (deploymentId) {
-      query = sql`
-        SELECT uh.*, p.name as project_name, d.status as deployment_status
-        FROM upload_history uh
-        LEFT JOIN deployments d ON uh.deployment_id = d.id
-        LEFT JOIN projects p ON d.project_id = p.id
-        WHERE uh.user_id = ${req.user!.userId} AND uh.deployment_id = ${deploymentId as string}
-      `
+    const query: any = {
+      userId: new mongoose.Types.ObjectId(req.user!.userId),
     }
 
-    const offset = (Number(page) - 1) * Number(limit)
-    const history = await sql`
-      ${query}
-      ORDER BY uh.created_at DESC
-      LIMIT ${Number(limit)} OFFSET ${offset}
-    `
+    if (deploymentId) {
+      query.deploymentId = deploymentId
+    }
 
-    const [{ count }] = await sql`
-      SELECT COUNT(*) as count FROM upload_history WHERE user_id = ${req.user!.userId}
-    `
+    const history = await UploadHistory.find(query).sort({ createdAt: -1 }).skip(skip).limit(limitNum).populate({
+      path: "userId",
+      select: "username email",
+    })
+
+    const count = await UploadHistory.countDocuments(query)
 
     res.json({
       data: history,
       pagination: {
-        page: Number(page),
-        limit: Number(limit),
-        total: Number(count),
-        pages: Math.ceil(Number(count) / Number(limit)),
+        page: pageNum,
+        limit: limitNum,
+        total: count,
+        pages: Math.ceil(count / limitNum),
       },
     })
   } catch (error) {
@@ -56,31 +46,61 @@ router.get("/", async (req: AuthRequest, res) => {
 // Get upload statistics
 router.get("/stats", async (req: AuthRequest, res) => {
   try {
-    const [stats] = await sql`
-      SELECT 
-        COUNT(*) as total_uploads,
-        SUM(file_size) as total_size,
-        COUNT(DISTINCT deployment_id) as total_deployments
-      FROM upload_history 
-      WHERE user_id = ${req.user!.userId}
-    `
+    const userId = new mongoose.Types.ObjectId(req.user!.userId)
 
-    const recentUploads = await sql`
-      SELECT DATE(created_at) as date, COUNT(*) as count
-      FROM upload_history 
-      WHERE user_id = ${req.user!.userId} 
-        AND created_at >= NOW() - INTERVAL '30 days'
-      GROUP BY DATE(created_at)
-      ORDER BY date DESC
-    `
+    const stats = await UploadHistory.aggregate([
+      { $match: { userId } },
+      {
+        $group: {
+          _id: null,
+          totalUploads: { $sum: 1 },
+          totalSize: { $sum: "$fileSize" },
+          totalDeployments: { $addToSet: "$deploymentId" },
+        },
+      },
+    ])
+
+    // Get recent activity (last 30 days)
+    const thirtyDaysAgo = new Date()
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+
+    const recentUploads = await UploadHistory.aggregate([
+      {
+        $match: {
+          userId,
+          createdAt: { $gte: thirtyDaysAgo },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+          },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: -1 } },
+    ])
+
+    const statsData =
+      stats.length > 0
+        ? {
+            totalUploads: stats[0].totalUploads,
+            totalSize: stats[0].totalSize,
+            totalDeployments: stats[0].totalDeployments.length,
+          }
+        : {
+            totalUploads: 0,
+            totalSize: 0,
+            totalDeployments: 0,
+          }
 
     res.json({
-      stats: {
-        totalUploads: Number(stats.total_uploads),
-        totalSize: Number(stats.total_size),
-        totalDeployments: Number(stats.total_deployments),
-      },
-      recentActivity: recentUploads,
+      stats: statsData,
+      recentActivity: recentUploads.map((item) => ({
+        date: item._id,
+        count: item.count,
+      })),
     })
   } catch (error) {
     console.error("Get stats error:", error)

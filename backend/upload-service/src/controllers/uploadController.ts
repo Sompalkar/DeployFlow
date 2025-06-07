@@ -5,7 +5,8 @@ import { v4 as uuidv4 } from "uuid"
 import path from "path"
 import fs from "fs"
 import type { AuthRequest } from "../middleware/auth"
-import { sql } from "../config/database"
+import UploadHistory from "../models/UploadHistory"
+import mongoose from "mongoose"
 
 const router = express.Router()
 
@@ -107,10 +108,13 @@ router.post("/file", upload.single("file"), async (req: AuthRequest, res) => {
     const s3Url = await uploadToS3(req.file.path, s3Key)
 
     // Log upload history
-    await sql`
-      INSERT INTO upload_history (user_id, deployment_id, file_name, file_url, file_size)
-      VALUES (${req.user!.userId}, ${deploymentId}, ${req.file.originalname}, ${s3Url}, ${req.file.size})
-    `
+    await UploadHistory.create({
+      userId: new mongoose.Types.ObjectId(req.user!.userId),
+      deploymentId,
+      fileName: req.file.originalname,
+      fileUrl: s3Url,
+      fileSize: req.file.size,
+    })
 
     // Clean up local file
     fs.unlinkSync(req.file.path)
@@ -143,10 +147,13 @@ router.post("/build", upload.array("files"), async (req: AuthRequest, res) => {
       uploadedFiles.push(s3Url)
 
       // Log upload history
-      await sql`
-        INSERT INTO upload_history (user_id, deployment_id, file_name, file_url, file_size)
-        VALUES (${req.user!.userId}, ${deploymentId}, ${file.originalname}, ${s3Url}, ${file.size})
-      `
+      await UploadHistory.create({
+        userId: new mongoose.Types.ObjectId(req.user!.userId),
+        deploymentId,
+        fileName: file.originalname,
+        fileUrl: s3Url,
+        fileSize: file.size,
+      })
 
       // Clean up local file
       fs.unlinkSync(file.path)
@@ -185,10 +192,13 @@ router.post("/directory", async (req: AuthRequest, res) => {
 
       // Log upload history
       const stats = fs.statSync(filePath)
-      await sql`
-        INSERT INTO upload_history (user_id, deployment_id, file_name, file_url, file_size)
-        VALUES (${req.user!.userId}, ${id}, ${relativePath}, ${s3Url}, ${stats.size})
-      `
+      await UploadHistory.create({
+        userId: new mongoose.Types.ObjectId(req.user!.userId),
+        deploymentId: id,
+        fileName: relativePath,
+        fileUrl: s3Url,
+        fileSize: stats.size,
+      })
     }
 
     res.json({
@@ -209,18 +219,17 @@ router.get("/status/:deploymentId", async (req: AuthRequest, res) => {
   try {
     const { deploymentId } = req.params
 
-    const uploads = await sql`
-      SELECT * FROM upload_history 
-      WHERE deployment_id = ${deploymentId} AND user_id = ${req.user!.userId}
-      ORDER BY created_at DESC
-    `
+    const uploads = await UploadHistory.find({
+      deploymentId,
+      userId: new mongoose.Types.ObjectId(req.user!.userId),
+    }).sort({ createdAt: -1 })
 
     res.json({
       deploymentId,
       status: uploads.length > 0 ? "completed" : "not_found",
       uploads,
       totalFiles: uploads.length,
-      totalSize: uploads.reduce((sum: number, upload: any) => sum + upload.file_size, 0),
+      totalSize: uploads.reduce((sum: number, upload: any) => sum + upload.fileSize, 0),
     })
   } catch (error) {
     console.error("Status check error:", error)
